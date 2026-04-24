@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>F3F PRO ANALYZER</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        :root {
+            --bg: #0f0f0f; --card: #1e1e1e; --accent: #00ff9d; --base-a: #ff3e3e; --base-b: #3e66ff;
+        }
+        body { font-family: 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: #eee; margin: 0; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
+        
+        /* Layout */
+        #map { height: 35vh; width: 100%; border-bottom: 2px solid #333; }
+        #dashboard { flex: 1; display: flex; flex-direction: column; padding: 10px; gap: 10px; overflow-y: auto; }
+
+        /* Chrono */
+        .chrono-container { background: var(--card); border-radius: 12px; padding: 15px; text-align: center; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+        .chrono-label { font-size: 0.8em; color: #888; text-transform: uppercase; letter-spacing: 2px; }
+        .chrono-time { font-size: 4.5em; font-family: 'Courier New', monospace; color: var(--accent); font-weight: bold; margin: 5px 0; }
+
+        /* Grid Stats */
+        .stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+        .stat-card { background: var(--card); padding: 12px; border-radius: 10px; border-left: 4px solid #444; }
+        .stat-card.active { border-left-color: var(--accent); }
+        .stat-label { font-size: 0.7em; color: #888; margin-bottom: 5px; }
+        .stat-value { font-size: 1.4em; font-weight: bold; }
+        .unit { font-size: 0.6em; color: #666; margin-left: 4px; }
+
+        /* Controls */
+        .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: auto; padding-bottom: 5px; }
+        .btn { padding: 15px; border: none; border-radius: 8px; font-weight: bold; text-transform: uppercase; cursor: pointer; transition: 0.2s; }
+        .btn-connect { background: #333; color: white; grid-column: span 2; border: 1px solid #555; }
+        .btn-a { background: var(--base-a); color: white; }
+        .btn-b { background: var(--base-b); color: white; }
+        .btn-download { background: #555; color: white; grid-column: span 2; }
+
+        /* Animations */
+        .blink { animation: blinker 1s linear infinite; }
+        @keyframes blinker { 50% { opacity: 0; } }
+    </style>
+</head>
+<body>
+
+    <div id="map"></div>
+
+    <div id="dashboard">
+        <button id="btnConnect" class="btn btn-connect">🔌 CONNECTER RADIO (USB-C)</button>
+
+        <div class="chrono-container">
+            <div class="chrono-label" id="status-label">ATTENTE START (BASE A)</div>
+            <div class="chrono-time" id="chrono-display">00.00</div>
+            <div id="lap-counter" style="color: #888;">TOUR : 0 / 10</div>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">VITESSE 3D</div>
+                <div class="stat-value"><span id="val-v3d">0</span><span class="unit">km/h</span></div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">ÉNERGIE TOTALE</div>
+                <div class="stat-value"><span id="val-energy">0</span><span class="unit">J/kg</span></div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">ALTITUDE</div>
+                <div class="stat-value"><span id="val-alt">0</span><span class="unit">m</span></div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">PROF / AIL</div>
+                <div class="stat-value"><span id="val-sticks">0 / 0</span></div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <button class="btn btn-a" onclick="setBase('A')">FIXER BASE A</button>
+            <button class="btn btn-b" onclick="setBase('B')">FIXER BASE B</button>
+            <button class="btn btn-download" onclick="downloadLog()">💾 TÉLÉCHARGER LE LOG EXPERT (.CSV)</button>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script>
+        let port, lastPos, posA, posB, isRacing = false, startTime = 0;
+        let flightLogs = [], nextBase = 'A', lapCount = 0;
+
+        // Initialisation Carte
+        const map = L.map('map', { zoomControl: false }).setView([48.85, 2.35], 13);
+        L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+}).addTo(map);
+
+        // Connexion USB
+        document.getElementById('btnConnect').onclick = async () => {
+            port = await navigator.serial.requestPort();
+            await port.open({ baudRate: 115200 });
+            document.getElementById('btnConnect').innerHTML = "✅ RADIO CONNECTÉE";
+            readLoop();
+        };
+
+        async function readLoop() {
+            const reader = port.readable.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            while (true) {
+                const { value, done } = await reader.read();
+                buffer += decoder.decode(value);
+                let lines = buffer.split("\n");
+                buffer = lines.pop();
+                lines.forEach(l => processData(l));
+            }
+        }
+
+        function processData(line) {
+            const d = line.split(";");
+            if (d.length < 8) return;
+
+            // Parsing
+            const lat = parseFloat(d[0]), lon = parseFloat(d[1]);
+            const gs = parseFloat(d[2]), vs = parseFloat(d[3]), alt = parseFloat(d[4]);
+            const ele = parseInt(d[5]), ail = parseInt(d[6]), rst = parseInt(d[7]);
+
+            if (rst === 1) resetChrono();
+
+            // Calculs
+            const v3d = Math.sqrt(Math.pow(gs, 2) + Math.pow(vs * 3.6, 2));
+            const energy = alt + (Math.pow(v3d / 3.6, 2) / 19.62);
+            
+            // Update UI
+            document.getElementById('val-v3d').innerText = Math.round(v3d);
+            document.getElementById('val-alt').innerText = alt.toFixed(1);
+            document.getElementById('val-energy').innerText = Math.round(energy);
+            document.getElementById('val-sticks').innerText = `${ele} / ${ail}`;
+
+            const currPos = {lat, lon};
+            if (lastPos) {
+                if (isRacing) updateChrono();
+                checkBases(lastPos, currPos);
+                updateMap(currPos, ele);
+            }
+            
+            // Logging Expert
+            flightLogs.push({ t: performance.now(), lat, lon, v3d, alt, ele, ail, lap: lapCount });
+            lastPos = currPos;
+        }
+
+        function updateMap(pos, ele) {
+            const latlng = [pos.lat, pos.lon];
+            pathLine.addLatLng(latlng);
+            map.panTo(latlng);
+            // Change couleur selon profondeur (Heatmap)
+            if (Math.abs(ele) > 500) pathLine.setStyle({color: '#ff3e3e'});
+            else pathLine.setStyle({color: '#00ff9d'});
+        }
+
+        function setBase(type) {
+            if (!lastPos) return alert("Pas de GPS !");
+            if (type === 'A') posA = {...lastPos}; else posB = {...lastPos};
+            L.marker([lastPos.lat, lastPos.lon]).addTo(map).bindPopup("BASE " + type).openPopup();
+            announce("Base " + type + " fixée");
+        }
+
+        function checkBases(p1, p2) {
+            if (!posA || !posB) return;
+            // Logique de franchissement simplifiée pour l'exemple
+            // ... (Utiliser la fonction de produit scalaire fournie précédemment)
+        }
+
+        function updateChrono() {
+            const time = (performance.now() - startTime) / 1000;
+            document.getElementById('chrono-display').innerText = time.toFixed(2);
+        }
+
+        function resetChrono() {
+            isRacing = false; lapCount = 0;
+            document.getElementById('chrono-display').innerText = "00.00";
+            document.getElementById('status-label').innerText = "ATTENTE START (BASE A)";
+        }
+
+        function downloadLog() {
+            let csv = "Time;Lat;Lon;V3D;Alt;Ele;Ail;Lap\n";
+            flightLogs.forEach(p => csv += `${p.t};${p.lat};${p.lon};${p.v3d};${p.alt};${p.ele};${p.ail};${p.lap}\n`);
+            const blob = new Blob([csv], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url; a.download = "F3F_LOG_EXPERT.csv"; a.click();
+        }
+
+        function announce(t) {
+            const s = new SpeechSynthesisUtterance(t);
+            s.lang = 'fr-FR'; window.speechSynthesis.speak(s);
+        }
+    </script>
+</body>
+</html>
